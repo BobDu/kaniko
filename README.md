@@ -144,6 +144,7 @@ expect - see [Known Issues](#known-issues).
       - [Flag `FF_KANIKO_CACHE_LOOKAHEAD`](#flag-ff_kaniko_cache_lookahead)
       - [Flag `FF_KANIKO_ROLLING_CACHE_KEY`](#flag-ff_kaniko_rolling_cache_key)
       - [Flag `FF_KANIKO_HASH_DIR_FRAMING`](#flag-ff_kaniko_hash_dir_framing)
+      - [Flag `FF_KANIKO_CACHE_HASH_BLAKE3`](#flag-ff_kaniko_cache_hash_blake3)
       - [Flag `FF_KANIKO_CACHE_PROBE_AFTER_MISS`](#flag-ff_kaniko_cache_probe_after_miss)
       - [Flag `FF_KANIKO_WARMER_CACHE_LOCK`](#flag-ff_kaniko_warmer_cache_lock)
       - [Flag `FF_KANIKO_PRESERVE_MOUNTED_PATHS`](#flag-ff_kaniko_preserve_mounted_paths)
@@ -1324,6 +1325,13 @@ Becomes default in `v1.29.0`.
 
 Directory cache keys concatenate each relative path and file hash without recording their boundaries. A filename can therefore absorb an adjacent hash and make distinct directory trees produce the same cache key, silently reusing the wrong cached layer.
 Set this flag to `true` to length-prefix every path and file hash before hashing the directory. Toggling it changes cache keys for `COPY` and `ADD` directory inputs, forcing those layers to rebuild once.
+Defaults to `false`.
+Becomes default in `v1.29.0`.
+
+#### Flag `FF_KANIKO_CACHE_HASH_BLAKE3`
+
+`COPY` and `ADD` inputs are folded into the layer cache key with md5, which is not collision resistant. The surrounding SHA256 does not help: its only input for a given file is that md5 digest, so two files with the same md5 produce the same cache key. Because the key is published as a registry tag and a cache hit is resolved by tag alone, anyone who can get colliding content into a build can make a later build reuse the wrong layer.
+Set this flag to `true` to hash those inputs with [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) instead. BLAKE3 is collision resistant and, unlike SHA256, does not depend on the SHA-NI extension, which Xeon Scalable v1-v3 does not implement. Toggling it changes cache keys for `COPY` and `ADD` inputs, forcing those layers to rebuild once.
 Defaults to `false`.
 Becomes default in `v1.29.0`.
 

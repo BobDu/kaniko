@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"math"
 	"os"
@@ -31,7 +32,9 @@ import (
 	"time"
 
 	"github.com/minio/highwayhash"
+	"github.com/osscontainertools/kaniko/pkg/config"
 	"github.com/sirupsen/logrus"
+	"github.com/zeebo/blake3"
 	"golang.org/x/sys/unix"
 )
 
@@ -91,10 +94,20 @@ func Hasher() func(string) (string, error) {
 	return hasher
 }
 
+// cacheHash returns the digest used to fold a file into a layer cache key. That key is
+// published as a registry tag and looked up by tag alone, so md5 is only kept for cache
+// compatibility, see FF_KANIKO_CACHE_HASH_BLAKE3.
+func cacheHash() hash.Hash {
+	if config.FF.CacheHashBlake3 {
+		return blake3.New()
+	}
+	return md5.New()
+}
+
 // CacheHasher takes into account everything the regular hasher does except for mtime
 func CacheHasher() func(string) (string, error) {
 	hasher := func(p string) (string, error) {
-		h := md5.New()
+		h := cacheHash()
 		fi, err := os.Lstat(p)
 		if err != nil {
 			return "", err
