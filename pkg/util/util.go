@@ -19,6 +19,7 @@ package util
 import (
 	"crypto/md5"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -30,8 +31,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/minio/highwayhash"
+	"github.com/osscontainertools/kaniko/pkg/assert"
 	"github.com/sirupsen/logrus"
+	"github.com/zeebo/xxh3"
 	"golang.org/x/sys/unix"
 )
 
@@ -41,52 +43,113 @@ const (
 	securityCapabilityXattr = "security.capability"
 )
 
+// hasherPrefix is the fixed-width header every hash starts with: mode, mtime seconds,
+// mtime nanoseconds, uid, gid, and the length of the variable-length field that follows
+// (the security capability for regular files, the target for symlinks). Fixed widths plus
+// that length mean no two distinct inputs can produce the same byte stream.
+//
+// mtime is stored as seconds plus nanoseconds rather than UnixNano: the latter is an int64
+// of nanoseconds, so it only spans 1677-2262 and silently wraps outside it, which would make
+// two mtimes 584 years apart hash the same.
+const hasherPrefix = 4 + 8 + 4 + 4 + 4 + 4
+
 // Hasher returns a hash function, used in snapshotting to determine if a file has changed
 func Hasher() func(string) (string, error) {
-	pool := sync.Pool{
+	bufs := sync.Pool{
 		New: func() any {
-			b := make([]byte, highwayhash.Size*10*1024)
+			// 320 KiB, unchanged (was highwayhash.Size*10*1024).
+			b := make([]byte, 320*1024)
 			return &b
 		},
 	}
-	key := make([]byte, highwayhash.Size)
+	// Only a file that does not fit in one buffer needs the streaming hasher; everything
+	// else is hashed in one call below, which needs no hasher state at all.
+	hashers := sync.Pool{New: func() any { return xxh3.New() }}
+
+	// streamRest hashes the header already sitting in buf, then the rest of f.
+	streamRest := func(buf []byte, upto int, f io.Reader) (string, error) {
+		h := hashers.Get().(*xxh3.Hasher)
+		h.Reset()
+		defer hashers.Put(h)
+		h.Write(buf[:upto])
+		if _, err := io.CopyBuffer(h, f, buf); err != nil {
+			return "", err
+		}
+		return hex.EncodeToString(h.Sum(nil)), nil
+	}
+
 	hasher := func(p string) (string, error) {
-		h, _ := highwayhash.New(key)
 		fi, err := os.Lstat(p)
 		if err != nil {
 			return "", err
 		}
-		h.Write([]byte(fi.Mode().String()))
-		h.Write([]byte(fi.ModTime().String()))
 
-		h.Write([]byte(strconv.FormatUint(uint64(fi.Sys().(*syscall.Stat_t).Uid), 36)))
-		h.Write([]byte(","))
-		h.Write([]byte(strconv.FormatUint(uint64(fi.Sys().(*syscall.Stat_t).Gid), 36)))
+		bufp := bufs.Get().(*[]byte)
+		defer bufs.Put(bufp)
+		buf := *bufp
 
-		if fi.Mode().IsRegular() {
+		st := fi.Sys().(*syscall.Stat_t)
+		mtime := fi.ModTime()
+		binary.LittleEndian.PutUint32(buf[0:], uint32(fi.Mode()))
+		binary.LittleEndian.PutUint64(buf[4:], uint64(mtime.Unix()))
+		binary.LittleEndian.PutUint32(buf[12:], uint32(mtime.Nanosecond()))
+		binary.LittleEndian.PutUint32(buf[16:], st.Uid)
+		binary.LittleEndian.PutUint32(buf[20:], st.Gid)
+		binary.LittleEndian.PutUint32(buf[24:], 0)
+		n := hasherPrefix
+
+		switch {
+		case fi.Mode().IsRegular():
 			capability, _ := Lgetxattr(p, "security.capability")
-			if capability != nil {
-				h.Write(capability)
+			// Guarded rather than a bare Assert: this runs per file, and Assert's variadic
+			// arguments are boxed at the call site even when the condition holds.
+			if hasherPrefix+len(capability) > len(buf) {
+				assert.Assert("hasher.capability-fits", false,
+					"security.capability of %s is %d bytes, larger than the %d byte hash buffer", p, len(capability), len(buf))
 			}
+			binary.LittleEndian.PutUint32(buf[24:], uint32(len(capability)))
+			n += copy(buf[n:], capability)
+
 			f, err := FSys.Open(p)
 			if err != nil {
 				return "", err
 			}
 			defer f.Close()
-			buf := pool.Get().(*[]byte)
-			defer pool.Put(buf)
-			if _, err := io.CopyBuffer(h, f, *buf); err != nil {
+
+			// Streaming a file that clearly does not fit avoids reading a whole
+			// buffer for nothing. Size is only a hint: if it understates, ReadFull
+			// below fills the buffer and falls through to streaming anyway.
+			if fi.Size() > int64(len(buf)-n) {
+				return streamRest(buf, n, f)
+			}
+
+			read, err := io.ReadFull(f, buf[n:])
+			switch err {
+			case io.EOF, io.ErrUnexpectedEOF:
+				// The whole file fit alongside the header.
+				n += read
+			case nil:
+				// More to read than Size claimed: xxh3 gives the same digest either way.
+				return streamRest(buf, n+read, f)
+			default:
 				return "", err
 			}
-		} else if fi.Mode()&os.ModeSymlink == os.ModeSymlink {
+		case fi.Mode()&os.ModeSymlink == os.ModeSymlink:
 			linkPath, err := os.Readlink(p)
 			if err != nil {
 				return "", err
 			}
-			h.Write([]byte(linkPath))
+			if hasherPrefix+len(linkPath) > len(buf) {
+				assert.Assert("hasher.linkpath-fits", false,
+					"symlink target of %s is %d bytes, larger than the %d byte hash buffer", p, len(linkPath), len(buf))
+			}
+			binary.LittleEndian.PutUint32(buf[24:], uint32(len(linkPath)))
+			n += copy(buf[n:], linkPath)
 		}
 
-		return hex.EncodeToString(h.Sum(nil)), nil
+		var sum [8]byte
+		binary.BigEndian.PutUint64(sum[:], xxh3.Hash(buf[:n]))
+		return hex.EncodeToString(sum[:]), nil
 	}
 	return hasher
 }

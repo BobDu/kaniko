@@ -22,7 +22,6 @@ require (
 	github.com/google/go-cmp v0.7.0
 	github.com/google/go-containerregistry v0.22.0
 	github.com/google/slowjam v1.1.2
-	github.com/minio/highwayhash v1.0.4
 	github.com/moby/buildkit v0.32.2
 	github.com/moby/go-archive v0.3.3
 	github.com/moby/moby/api v1.55.0
@@ -35,6 +34,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10
 	github.com/tonistiigi/dchapes-mode v0.0.0-20250318174251-73d941a28323
+	github.com/zeebo/xxh3 v1.1.0
 	go.opentelemetry.io/otel v1.45.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.45.0
 	go.opentelemetry.io/otel/sdk v1.45.0
